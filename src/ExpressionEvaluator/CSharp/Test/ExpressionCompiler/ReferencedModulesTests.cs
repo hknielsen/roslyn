@@ -304,10 +304,11 @@ IL_0005:  ret
         /// Two parallel AssemblyLoadContexts each load an assembly with the same identity
         /// "Lib", but the copy loaded by the first ALC is a stale build missing type B.
         /// The frame's module (App, loaded by the second ALC) references the current build.
-        /// The EE resolves the assembly reference to the first equivalent identity in
-        /// metadata-block order (EEMetadataReferenceResolver.GetBestMatch returns the first
-        /// Equivalent match), so evaluation binds to whichever copy the debugger enumerated
-        /// first — not the copy the frame's load context actually references.
+        /// When multiple equivalent identities are present, the resolver validates each
+        /// candidate against the top-level type names the referencing module uses from that
+        /// assembly (EEMetadataReferenceResolver.GetBestMatch), so evaluation binds to a
+        /// copy that actually satisfies the frame module's references regardless of the
+        /// debugger's enumeration order.
         /// </summary>
         [Fact, WorkItem("https://github.com/dotnet/roslyn/issues/55857")]
         public void DuplicateAssembliesInParallelLoadContexts_DifferentContent()
@@ -321,8 +322,8 @@ IL_0005:  ret
             {
                 var state = GetContextState(runtime, "C.M");
 
-                // Stale copy enumerated first (loaded by the first ALC): the parameter 'b'
-                // of type Lib!B cannot be evaluated.
+                // Stale copy enumerated first (loaded by the first ALC): the resolver must
+                // skip it in favor of the copy that defines B.
                 var context = CreateMethodContext(
                     new AppDomain(),
                     ImmutableArray.Create(moduleMscorlib, moduleLibStale, moduleLib, moduleApp).SelectAsArray(m => m.MetadataBlock),
@@ -330,7 +331,7 @@ IL_0005:  ret
                 string error;
                 var testData = new CompilationTestData();
                 context.CompileExpression("b", out error, testData);
-                Assert.Equal("error CS7069: Reference to type 'B' claims it is defined in 'Lib', but it could not be found", error);
+                Assert.Null(error);
 
                 // Identical debuggee state, opposite enumeration order: evaluation succeeds.
                 context = CreateMethodContext(
@@ -358,8 +359,11 @@ IL_0005:  ret
             var (identityMscorlib, moduleMscorlib) = (MscorlibRef.GetAssemblyIdentity(), MscorlibRef.ToModuleInstance());
             var compLib = CreateCompilation(new AssemblyIdentity("Lib", new Version(1, 0, 0, 0)), new[] { "public class B { }" }, references: new[] { MscorlibRef }, options: TestOptions.DebugDll);
             var imageLib = compLib.EmitToArray();
+            // A separate buffer with identical bytes: LoadFromStream pins a fresh copy of
+            // the image per load, so each runtime module instance has its own metadata block.
+            var imageLibCopy = ImmutableArray.CreateRange(imageLib);
             var moduleLib1 = ModuleInstance.Create(imageLib, symReader: null);
-            var moduleLib2 = ModuleInstance.Create(imageLib, symReader: null);
+            var moduleLib2 = ModuleInstance.Create(imageLibCopy, symReader: null);
             Assert.Equal(moduleLib1.Id.Id, moduleLib2.Id.Id); // same MVID
             Assert.NotEqual(moduleLib1.MetadataBlock.Pointer, moduleLib2.MetadataBlock.Pointer); // distinct module instances
 
