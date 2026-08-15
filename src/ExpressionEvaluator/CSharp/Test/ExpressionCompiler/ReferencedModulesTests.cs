@@ -8,6 +8,7 @@ using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Linq;
+using System.Reflection.Metadata;
 using System.Reflection.PortableExecutable;
 using Microsoft.Cci;
 using Microsoft.CodeAnalysis.CodeGen;
@@ -296,6 +297,95 @@ IL_0000:  newobj     ""B..ctor()""
 IL_0005:  ret
 }");
                 VerifyResolutionRequests(context, (identityA2, identityA3, 1));
+            }
+        }
+
+        /// <summary>
+        /// Two parallel AssemblyLoadContexts each load an assembly with the same identity
+        /// "Lib", but the copy loaded by the first ALC is a stale build missing type B.
+        /// The frame's module (App, loaded by the second ALC) references the current build.
+        /// The EE resolves the assembly reference to the first equivalent identity in
+        /// metadata-block order (EEMetadataReferenceResolver.GetBestMatch returns the first
+        /// Equivalent match), so evaluation binds to whichever copy the debugger enumerated
+        /// first — not the copy the frame's load context actually references.
+        /// </summary>
+        [Fact, WorkItem("https://github.com/dotnet/roslyn/issues/55857")]
+        public void DuplicateAssembliesInParallelLoadContexts_DifferentContent()
+        {
+            var (identityMscorlib, moduleMscorlib) = (MscorlibRef.GetAssemblyIdentity(), MscorlibRef.ToModuleInstance());
+            var (identityLibStale, moduleLibStale, refLibStale) = Compile(new AssemblyIdentity("Lib", new Version(1, 0, 0, 0)), "public class A { }", TestOptions.DebugDll, MscorlibRef);
+            var (identityLib, moduleLib, refLib) = Compile(new AssemblyIdentity("Lib", new Version(1, 0, 0, 0)), "public class A { } public class B { }", TestOptions.DebugDll, MscorlibRef);
+            var (identityApp, moduleApp, refApp) = Compile(new AssemblyIdentity("App", new Version(1, 0, 0, 0)), "public class C { static void M(B b) { } }", TestOptions.DebugDll, refLib, MscorlibRef);
+
+            using (var runtime = CreateRuntimeInstance(new[] { moduleMscorlib, moduleLib, moduleApp }))
+            {
+                var state = GetContextState(runtime, "C.M");
+
+                // Stale copy enumerated first (loaded by the first ALC): the parameter 'b'
+                // of type Lib!B cannot be evaluated.
+                var context = CreateMethodContext(
+                    new AppDomain(),
+                    ImmutableArray.Create(moduleMscorlib, moduleLibStale, moduleLib, moduleApp).SelectAsArray(m => m.MetadataBlock),
+                    state);
+                string error;
+                var testData = new CompilationTestData();
+                context.CompileExpression("b", out error, testData);
+                Assert.Equal("error CS7069: Reference to type 'B' claims it is defined in 'Lib', but it could not be found", error);
+
+                // Identical debuggee state, opposite enumeration order: evaluation succeeds.
+                context = CreateMethodContext(
+                    new AppDomain(),
+                    ImmutableArray.Create(moduleMscorlib, moduleLib, moduleLibStale, moduleApp).SelectAsArray(m => m.MetadataBlock),
+                    state);
+                testData = new CompilationTestData();
+                context.CompileExpression("b", out error, testData);
+                Assert.Null(error);
+            }
+        }
+
+        /// <summary>
+        /// Two parallel AssemblyLoadContexts LoadFromStream the same "Lib" image: two
+        /// runtime module instances with byte-identical metadata and the same MVID.
+        /// The EE binds the assembly reference to the module instance whose metadata block
+        /// was enumerated first. A frame whose ALC loaded the second instance cannot request
+        /// its own copy: ModuleId (and MetadataContextId) carry only the MVID, which is
+        /// identical for both instances, so the EE compiles against — and the debugger
+        /// consequently func-evals in — the first-loaded module.
+        /// </summary>
+        [Fact, WorkItem("https://github.com/dotnet/runtime/issues/132135")]
+        public void DuplicateAssembliesInParallelLoadContexts_SameMvid()
+        {
+            var (identityMscorlib, moduleMscorlib) = (MscorlibRef.GetAssemblyIdentity(), MscorlibRef.ToModuleInstance());
+            var compLib = CreateCompilation(new AssemblyIdentity("Lib", new Version(1, 0, 0, 0)), new[] { "public class B { }" }, references: new[] { MscorlibRef }, options: TestOptions.DebugDll);
+            var imageLib = compLib.EmitToArray();
+            var moduleLib1 = ModuleInstance.Create(imageLib, symReader: null);
+            var moduleLib2 = ModuleInstance.Create(imageLib, symReader: null);
+            Assert.Equal(moduleLib1.Id.Id, moduleLib2.Id.Id); // same MVID
+            Assert.NotEqual(moduleLib1.MetadataBlock.Pointer, moduleLib2.MetadataBlock.Pointer); // distinct module instances
+
+            var refLib = moduleLib1.GetReference();
+            var (identityApp, moduleApp, refApp) = Compile(new AssemblyIdentity("App", new Version(1, 0, 0, 0)), "public class C { static void M(B b) { } }", TestOptions.DebugDll, refLib, MscorlibRef);
+
+            using (var runtime = CreateRuntimeInstance(new[] { moduleMscorlib, moduleLib1, moduleApp }))
+            {
+                var state = GetContextState(runtime, "C.M");
+                var blocks = ImmutableArray.Create(moduleMscorlib, moduleLib1, moduleLib2, moduleApp).SelectAsArray(m => m.MetadataBlock);
+                var context = CreateMethodContext(new AppDomain(), blocks, state);
+
+                string error;
+                var testData = new CompilationTestData();
+                context.CompileExpression("b", out error, testData);
+                Assert.Null(error);
+
+                // The EE bound 'Lib' to the metadata block enumerated first, regardless of
+                // which module instance the frame's load context actually holds.
+                var resolver = (EEMetadataReferenceResolver)context.Compilation.Options.MetadataReferenceResolver;
+                var resolved = resolver.ResolveMissingAssembly(refApp, compLib.Assembly.Identity);
+                var resolvedMetadata = (AssemblyMetadata)resolved.GetMetadataNoCopy();
+                unsafe
+                {
+                    Assert.Equal(moduleLib1.MetadataBlock.Pointer, (IntPtr)resolvedMetadata.GetModules()[0].MetadataReader.MetadataPointer);
+                }
             }
         }
 
