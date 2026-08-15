@@ -361,7 +361,8 @@ IL_0005:  ret
             var imageLib = compLib.EmitToArray();
             // A separate buffer with identical bytes: LoadFromStream pins a fresh copy of
             // the image per load, so each runtime module instance has its own metadata block.
-            var imageLibCopy = ImmutableArray.CreateRange(imageLib);
+            // (ToArray() forces the copy; ImmutableArray.CreateRange would return the same array.)
+            var imageLibCopy = ImmutableArray.Create(imageLib.ToArray());
             var moduleLib1 = ModuleInstance.Create(imageLib, symReader: null);
             var moduleLib2 = ModuleInstance.Create(imageLibCopy, symReader: null);
             Assert.Equal(moduleLib1.Id.Id, moduleLib2.Id.Id); // same MVID
